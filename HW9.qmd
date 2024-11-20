@@ -1,0 +1,922 @@
+---
+title: "Homework9"
+format: html
+toc: TRUE
+---
+
+# Last week: Homework 8
+
+Libraries
+
+```{r}
+library(tidyverse)
+library(tidymodels)
+
+# added for HW 9
+library(baguette)
+```
+
+## Reading Data
+
+Read in the data from URL, using a solution from a Stack Overflow post to fix the initial error.
+
+```{r}
+bike_data <- read_csv("https://www4.stat.ncsu.edu/~online/datasets/SeoulBikeData.csv",
+                     locale = locale(encoding="latin1"))
+
+bike_data
+```
+
+Rename all columns to make them easier to work with
+
+```{r}
+names(bike_data) <- c("date", "rented_bike_count", "hour", "temperature", "humidity",
+                      "wind_speed", "visibility", "dew_point", "solar_radiation",
+                      "rainfall", "snowfall", "seasons", "holiday", "functioning_day")
+```
+
+
+## Basic EDA
+
+Look at structure, see if there are columns that are an unexpected data type based on the values
+
+- date is char, should be changed to date
+- humidity values are stored in a way that makes sense for display (e.g. 37 for 37%), but would need to be divided by 100 if used for computations (unless the computation only involves itself as a variable, e.g. taking the average humidity level)
+- seasons, holiday, and functioning_day are character variables that need to be recast as factors
+- all other variables are numeric, as expected
+
+```{r}
+str(bike_data)
+```
+Recast date - format appears to be dd/mm/yyyy, due to the presence of strings like "15/03/2018"
+
+```{r}
+bike_data <- bike_data |>
+  mutate(date = dmy(date))
+```
+
+check the min and max dates in each season to see the order the seasons should be in when that column is recast as factor
+```{r}
+bike_data |>
+  group_by(seasons) |>
+  summarize(min_date = min(date),
+            max_date = max(date)) |>
+  arrange(min_date)
+```
+
+Convert char columns to factors
+
+```{r}
+bike_data <- bike_data |>
+  mutate(seasons = factor(seasons,
+                          levels = c("Winter", "Spring", "Summer", "Autumn")),
+         holiday = as.factor(holiday),
+         functioning_day = as.factor(functioning_day))
+
+bike_data
+```
+
+Check for missing values 
+
+```{r}
+colSums(is.na(bike_data))
+```
+
+Basic summaries for numeric columns
+
+```{r}
+psych::describe(bike_data)
+```
+
+Look at distinct values for the rest of the categorical variables (already did seasons above)
+
+```{r}
+bike_data |>
+  group_by(holiday) |>
+  summarize(count = n())
+```
+
+```{r}
+bike_data |>
+  group_by(functioning_day) |>
+  summarize(count = n(),
+            total_bikes = sum(rented_bike_count))
+```
+No bikes can be rented on non-functioning days, so those days should be excluded from the model
+
+## Data rollup
+
+Produce summarized data by:
+
+- grouping by date, seasons, and holiday
+- taking the sum of rented_bike_count, rainfall, and snowfall
+- taking the mean of temperature, humidity, wind_speed, visibility, dew_point, solar_radiation
+
+```{r}
+bike_rollup <- bike_data |>
+  filter(functioning_day == "Yes") |>
+  group_by(date, seasons, holiday) |>
+  summarize(across(c(rented_bike_count, rainfall, snowfall), sum),
+            across(c(temperature, humidity, wind_speed, visibility, 
+                     dew_point, solar_radiation), mean))
+
+bike_rollup
+```
+
+## EDA Part 2
+
+Repeat EDA for the new rollup
+
+### Summary stats
+
+```{r}
+psych::describe(bike_rollup)
+```
+
+- Noting that the mean for rented_bike_count is now a lot higher, which is expected after removing the non-functioning days, and also after taking the sum for all hours for a specific day and then taking the average of that
+
+```{r}
+bike_data |>
+  filter(functioning_day == "Yes") |>
+  group_by(date) |>
+  summarize(daily_bikes = sum(rented_bike_count)) |>
+  summarize(mean(daily_bikes))
+```
+
+### Plots & Correlation
+
+#### Density plot for daily bikes
+
+```{r}
+g <- ggplot(bike_rollup, aes(x = rented_bike_count, fill = seasons))
+g + geom_density(alpha = 0.5)
+  
+```
+
+I expected to see fewer bikes rented per day during the winter, but the density plot shows it's much more of a pronounced difference than I thought. Interesting that it rarely broke 10K bikes in the winter, whereas the that would be an unusually low day for summer and autumn. Also kind of interesting that the summer and spring patterns look almost bimodal, so I will be curious to see if there are correlations among the weather-related variables that may explain that.
+
+
+#### Correlation
+
+```{r}
+bike_rollup |>
+  select(where(is.numeric)) |>
+  ungroup() |>
+  select(-date, -seasons) |>
+  cor()
+```
+
+Dew point, solar radiation, and temperature all seem to have a relatively strong positive correlation to bikes rented. Dew point is also very strongly correlated to temperature, so it makes sense they would both show high correlation to bikes rented (as opposed to only one of them showing a correlation). Solar radiation is interesting, because it is most highly correlated to rented bike count, and only weakly correlated to temperature, and does not show much of a linear relationship to anything else. It seems a bit odd that solar radiation would be related to the rented bike count, while simultaneously showing very little linear relationship to rainfall and snowfall, considering solar radiation may be impacted significantly by precipitation. 
+
+#### Scatter plots
+
+Running scatter plots on the most highly correlated variables 
+
+```{r}
+g <- ggplot(bike_rollup, aes(y = rented_bike_count, x = temperature))
+
+g + geom_point(aes(color = seasons))
+```
+
+Kind of cool, can see clear distinctions in the rented counts vs temperature between the different seasons 
+
+```{r}
+g <- ggplot(bike_rollup, aes(y = rented_bike_count, 
+                             x = solar_radiation, 
+                             color = seasons))
+
+g + 
+  geom_point() +
+  geom_smooth(method = "lm")
+```
+
+Definitely can still see the correlation between solar radiation and bike counts, but there's less of a clear pattern to the seasons
+
+```{r}
+g <- ggplot(bike_rollup, aes(y = rented_bike_count, x = dew_point, color = seasons))
+
+g + 
+  geom_point() + 
+  geom_smooth(method = "lm")
+```
+
+Looks a lot like the temperature vs rented bikes scatter plot, which kind of makes sense since the dew point is so closely related to the temperature 
+
+## Split the Data
+
+75/25 training to test split
+
+```{r}
+# create the split
+bike_split <- initial_split(bike_rollup, prop = 0.75, strata = seasons)
+
+# create the training and test data sets
+bike_train <- training(bike_split)
+bike_test <- testing(bike_split)
+
+```
+
+10-fold CV split
+
+```{r}
+# split training set into 10 groups
+bike_10_fold <- vfold_cv(bike_train, 10)
+
+```
+
+## Fitting MLR Models
+
+### Data Preprocessing
+
+Create 3 recipes to preprocess the data for use in MLR models
+
+Recipe 1
+
+- define role for date as an ID column so it's not included in the model, but will be retained in the data set
+- add new factor that determines whether the day of the week for each date falls on the weekend or during the week
+- standardize numeric variables, except for the outcome
+
+```{r}
+bike_rec_1 <- recipe(rented_bike_count ~ ., data = bike_train) |>
+  update_role(date, new_role = "ID") |>
+  step_date(date, features = c("dow")) |>
+  step_mutate(part_of_week = factor(if_else(date_dow %in% c("Sat", "Sun"),
+                                        "Weekend",
+                                        "Weekday"),
+                                levels = c("Weekday", "Weekend"))) |>
+  step_rm(date_dow) |>
+  step_normalize(all_numeric(), -all_outcomes()) |>
+  step_dummy(seasons, holiday, part_of_week)
+  
+
+# view data to make sure it looks okay
+bike_rec_1 |>
+  prep(training = bike_train) |>
+  bake(bike_train)
+```
+
+Formula for recipe 1
+```{r}
+bike_rec_1 |>
+  prep(training = bike_train) |>
+  formula()
+```
+
+
+Recipe 2
+
+- Same transformations as recipe 1
+- Add interactions to the model formula:
+    + seasons and holiday
+    + seasons and temp
+    + temp and rainfall
+- On the first pass, I did not have the step_corr in the preprocessing, but the fit_resamples() generated a warning that stated: "prediction from rank-deficient fit; consider predict(., rankdeficient="NA"). There were issues with some computations   A: x1".
+    + First, I tried step_zv(), since the tidymodel tutorial had stated that if there are dummy variables with low-frequency values that don't occur in the training data, then it's possible for some of the downstream functions to generate warnings. That didn't work.
+    + From other google results, I didn't find much about the exact warning, but there was a really similar one that apparently can happen when there are variables with really high correlation. Dew point and temperature are very highly correlated, so I decided to use step_cor to address this, and it worked.
+
+```{r}
+bike_rec_2 <- recipe(rented_bike_count ~ ., data = bike_train) |>
+  update_role(date, new_role = "ID") |>
+  step_date(date, features = c("dow")) |>
+  step_mutate(part_of_week = factor(if_else(date_dow %in% c("Sat", "Sun"),
+                                        "Weekend",
+                                        "Weekday"),
+                                levels = c("Weekday", "Weekend"))) |>
+  step_rm(date_dow) |>
+  step_normalize(all_numeric(), -all_outcomes()) |>
+  step_dummy(seasons, holiday, part_of_week) |>
+  step_interact(terms = ~ holiday_No.Holiday : starts_with("seasons_") +
+                        temperature : starts_with("seasons_") + 
+                        temperature : rainfall) |>
+  #step_zv(all_predictors()) |>
+  step_corr(all_predictors())
+  
+bike_rec_2 |>
+  prep(training = bike_train) |>
+  bake(bike_train)
+```
+
+Formula for recipe 2
+```{r}
+bike_rec_2 |>
+  prep(training = bike_train) |>
+  formula()
+```
+
+Recipe 3
+
+- Same transformations and interactions as recipe 2
+- Add quadratic terms for the numeric predictors 
+
+Note: On the quadratic step, I initially tried to do `step_poly(all_numeric_predictors())`, but got an error that said "'degree' must be less than number of unique points". A post on Stack Overflow states this is because there must be columns that don't have enough unique values. Since the degree is 2, the variables included in step_poly must have at least 3 unique values. All the dummy variables had only 2 unique values. Moving step_poly before step_interact only produced more errors, so I decided to just list out the original predictor variables.
+
+
+```{r}
+
+bike_rec_3 <- recipe(rented_bike_count ~ ., data = bike_train) |>
+  update_role(date, new_role = "ID") |>
+  step_date(date, features = c("dow")) |>
+  step_mutate(part_of_week = factor(if_else(date_dow %in% c("Sat", "Sun"),
+                                        "Weekend",
+                                        "Weekday"),
+                                levels = c("Weekday", "Weekend"))) |>
+  step_rm(date_dow) |>
+  step_normalize(all_numeric(), -all_outcomes()) |>
+  step_dummy(seasons, holiday, part_of_week) |>
+  step_interact(terms = ~ holiday_No.Holiday : starts_with("seasons_") +
+                        temperature : starts_with("seasons_") + 
+                        temperature : rainfall) |>
+  # step_poly(all_numeric_predictors())
+  step_poly(rainfall, snowfall, temperature, humidity, wind_speed, visibility,
+            dew_point, solar_radiation) |>
+  step_corr(all_predictors())
+  
+bike_rec_3 |>
+  prep(training = bike_train) |>
+  bake(bike_train)
+
+```
+
+Formula for recipe 3
+```{r}
+bike_rec_3 |>
+  prep(training = bike_train) |>
+  formula()
+```
+
+### Fit the Models
+
+Using a linear model
+
+```{r}
+bike_model <- linear_reg() |>
+  set_engine("lm")
+```
+
+
+#### Workflows
+
+Set up workflows to use with 10-fold SV to fit a linear model
+
+Recipe 1
+
+```{r}
+bike_wfl_1 <- workflow() |>
+  add_recipe(bike_rec_1) |>
+  add_model(bike_model)
+
+bike_wfl_1
+```
+
+
+Recipe 2
+
+```{r}
+bike_wfl_2 <- workflow() |>
+  add_recipe(bike_rec_2) |>
+  add_model(bike_model)
+
+bike_wfl_2
+```
+
+Recipe 3
+
+```{r}
+bike_wfl_3 <- workflow() |>
+  add_recipe(bike_rec_3) |>
+  add_model(bike_model)
+
+bike_wfl_3
+```
+
+#### CV Fit on Model
+
+Have already set up the 10-fold CV split
+
+Model 1
+
+```{r}
+bike_CV_fits_1 <- bike_wfl_1 |>
+  fit_resamples(bike_10_fold) 
+
+bike_CV_fits_1 |>
+  collect_metrics()
+```
+
+Model 2
+
+```{r}
+bike_CV_fits_2 <- bike_wfl_2 |>
+  fit_resamples(bike_10_fold) 
+
+bike_CV_fits_2 |>
+  collect_metrics()
+```
+
+Model 3
+
+```{r}
+bike_CV_fits_3 <- bike_wfl_3 |>
+  fit_resamples(bike_10_fold) 
+
+bike_CV_fits_3 |>
+  collect_metrics()
+```
+
+## Fit on Entire Training Data
+
+I ran the previous code multiple times, and the RMSE for each model was variable. Each of the models had the lowest RMSE at least once, but I feel that the second model seems to come in lowest pretty often, so that's the one I went with.
+
+Fit the best model on the entire training set:
+
+```{r}
+
+bike_wfl_2 |>
+  #fit(bike_train) |>
+  last_fit(bike_split) |>
+  collect_metrics()
+
+```
+
+Fit model on the test data
+
+```{r}
+# workflow for 2nd model
+#lm_fit <- fit(bike_wfl_2, bike_train)
+
+# prediction for bikes rented on the test set
+bike_test_res <- bike_wfl_2 |>
+  fit(bike_train) |>
+  predict(new_data = bike_test)
+
+bike_test_res
+```
+
+
+Compute RMSE on the test data (confirm model error given above by last_fit)
+
+```{r}
+# add in the truth values
+bike_test_res <- bike_test_res |>
+  bind_cols(bike_test |> ungroup() |> select(rented_bike_count))
+
+# compare to predicted values
+bike_test_res |>
+  rmse(truth = rented_bike_count, estimate = .pred)
+```
+
+## Final Model
+
+Fit on the entire training set, get coefficient table
+
+```{r}
+bike_wfl_2 |>
+  #last_fit(bike_split) |>
+  fit(bike_train) |>
+  extract_fit_parsnip() |>
+  tidy()
+
+```
+
+Really big coefficients, which might be expected since all numeric predictors were standardized, but the outcome was not. To make sure, I am going to plot the predictions over the original data to make sure it looks okay.
+
+Plot predictions from the test data against the temperature values in that set, since temperature seems to be the most significant predictor
+
+```{r}
+# take predictions already made, and combine with temperature values
+mlm_points <- bike_test_res[".pred"] |>
+  bind_cols(bike_test |> ungroup() |> select(temperature))
+
+# plot original data, with the model line overlay
+g <- ggplot(bike_rollup, aes(x = temperature, y = rented_bike_count)) 
+g + geom_point(aes(color = seasons)) +
+  geom_smooth(data = mlm_points, aes(x = temperature, y = .pred))
+
+```
+
+
+Hey, it looks pretty good!
+
+
+# Homework 9
+
+***Note:*** *I realized only after submitting HW8 that I was looking at the wrong metric when determining which model was best. I was looking at the standard error of the RMSE rather than the mean RMSE. This led me to select Model 2 instead of Model 3. I am going to complete HW9 by switching to Model 3.*
+
+## Best MLR Model from Last Week
+
+Model 3
+
+```{r}
+# prediction for bikes rented on the test set
+bike_test_res <- bike_wfl_3 |>
+  fit(bike_train) |>
+  predict(new_data = bike_test)
+
+# add in the truth values
+bike_test_res <- bike_test_res |>
+  bind_cols(bike_test |> ungroup() |> select(rented_bike_count))
+
+# compare to predicted values - RMSE and MAE
+MLR_metrics <- bind_rows(bike_test_res |> rmse(truth = rented_bike_count, estimate = .pred),
+                         bike_test_res |> mae(truth = rented_bike_count, estimate = .pred)) |>
+  bind_cols(Model = rep("MLR Model", 2)) |>
+  select(Model, everything())
+
+MLR_metrics
+```
+
+Redo plot on Model 3 predictions
+```{r}
+# take predictions already made, and combine with temperature values
+mlm_points <- bike_test_res[".pred"] |>
+  bind_cols(bike_test |> ungroup() |> select(temperature))
+
+# plot original data, with the model line overlay
+g <- ggplot(bike_rollup, aes(x = temperature, y = rented_bike_count)) 
+g + geom_point(aes(color = seasons)) +
+  geom_smooth(data = mlm_points, aes(x = temperature, y = .pred))
+
+```
+
+Report coefficients
+
+```{r}
+
+bike_wfl_3 |>
+  fit(bike_train) |>
+  extract_fit_parsnip() |>
+  tidy()
+```
+
+
+## LASSO 
+
+LASSO model instance
+
+```{r}
+LASSO_spec <- linear_reg(penalty = tune(), mixture = 1) |>
+  set_engine("glmnet")
+```
+
+Workflow for LASSO
+
+- Using recipe from MLR model 1, because it's standardized and does not have interactions or quadratics
+
+```{r}
+LASSO_wkf <- workflow() |>
+  add_recipe(bike_rec_1) |>
+  add_model(LASSO_spec)
+
+```
+
+Set up tuning grid for finding parameters
+
+```{r}
+LASSO_grid <- LASSO_wkf |>
+  tune_grid(resamples = bike_10_fold,
+            grid = grid_regular(penalty(), levels = 200))
+
+# lowest RMSE for LASSO
+lowest_rmse_lasso <- LASSO_grid |>
+  select_best(metric = "rmse")
+
+lowest_rmse_lasso
+
+```
+
+Fit the best LASSO model on the entire training set
+
+```{r}
+LASSO_final <- LASSO_wkf |>
+  finalize_workflow(lowest_rmse_lasso) |>
+  fit(bike_train)
+
+# Report coefficients
+LASSO_final |>
+  extract_fit_parsnip() |>
+  tidy()
+```
+
+Predict with LASSO model on the test set
+
+```{r}
+# predictions, plus the truth values
+LASSO_predict <- LASSO_final |>
+  predict(bike_test) |>
+  bind_cols(bike_test |> ungroup() |> select(rented_bike_count))
+
+# compare to predicted values
+LASSO_metrics <- bind_rows(LASSO_predict |> 
+                             rmse(truth = rented_bike_count, estimate = .pred),
+                           LASSO_predict |>
+                             mae(truth = rented_bike_count, estimate = .pred)) |>
+  bind_cols(Model = rep("LASSO Model", 2)) |>
+  select(Model, everything())
+
+LASSO_metrics
+```
+
+## Regression Tree Model
+
+Define the model
+
+```{r}
+tree_model <- decision_tree(tree_depth = tune(),
+                            min_n = 20,
+                            cost_complexity = tune()) |>
+  set_engine("rpart") |>
+  set_mode("regression")
+
+```
+
+Define workflow, using same recipe as the 3rd MLR model
+
+```{r}
+tree_wkf <- workflow() |>
+  add_recipe(bike_rec_3) |>
+  add_model(tree_model)
+
+```
+
+Define grid for the tuning grid
+
+```{r}
+tree_grid <- grid_regular(cost_complexity(),
+                          tree_depth(),
+                          levels = c(10, 5))
+```
+
+Perform tuning
+
+```{r}
+# run the tuning
+tree_fits <- tree_wkf |>
+  tune_grid(resamples = bike_10_fold,
+            grid = tree_grid)
+
+# return the best parameters
+tree_best_params <- tree_fits |>
+  select_best(metric = "rmse")
+
+tree_best_params
+```
+
+Fit the training set with this best model
+
+```{r}
+# finalize workflow
+tree_final_wkf <- tree_wkf |>
+  finalize_workflow(tree_best_params)
+
+# fit to entire training data
+tree_final_fit <- tree_final_wkf |>
+  last_fit(bike_split)
+
+# extract
+tree_final_model <- extract_workflow(tree_final_fit)
+
+# plot the final fit
+tree_final_model |>
+  extract_fit_engine() |>
+  rpart.plot::rpart.plot(roundint = FALSE)
+
+```
+
+Look at metrics RMSE and MAE on the test data
+
+```{r}
+# predictions, plus the truth values
+tree_predict <- tree_final_wkf |>
+  fit(bike_train) |>
+  predict(bike_test) |>
+  bind_cols(bike_test |> ungroup() |> select(rented_bike_count))
+
+# compare to predicted values
+tree_metrics <- bind_rows(tree_predict |> 
+                             rmse(truth = rented_bike_count, estimate = .pred),
+                           tree_predict |>
+                             mae(truth = rented_bike_count, estimate = .pred)) |>
+  bind_cols(Model = rep("Regression Tree", 2)) |>
+  select(Model, everything())
+
+tree_metrics
+```
+
+## Bagged Tree Model
+
+Define model, using regression since the response variable is numeric, continuous
+
+```{r}
+bag_model <- bag_tree(tree_depth = 5, min_n = 10, cost_complexity = tune()) |>
+  set_engine("rpart") |>
+  set_mode("regression")
+```
+
+Create workflow, using same recipe from MLR model 3
+
+```{r}
+bag_wkf <- workflow() |>
+  add_recipe(bike_rec_3) |>
+  add_model(bag_model)
+```
+
+Fit to the CV folds
+
+```{r}
+# fit
+bag_fit <- bag_wkf |>
+  tune_grid(resamples = bike_10_fold,
+            grid = grid_regular(cost_complexity(),
+                                levels = 15))
+
+# get best parameters
+bag_best_params <- bag_fit |>
+  select_best(metric = "rmse")
+
+bag_best_params
+```
+
+Refit the entire training set
+
+```{r}
+# finalize workflow
+bag_final_wkf <- bag_wkf |>
+  finalize_workflow(bag_best_params)
+
+# fit on training set
+bag_final_fit <- bag_final_wkf |>
+  last_fit(bike_split)
+
+bag_final_fit |> collect_metrics()
+```
+
+Variable importance plot
+
+```{r}
+# extract
+bag_final_model <- extract_fit_engine(bag_final_fit)
+
+# variable importance plot
+bag_final_model$imp |>
+  mutate(term = factor(term, levels = term)) |>
+  ggplot(aes(x = term, y = value)) +
+  geom_bar(stat = "identity") +
+  coord_flip()
+```
+
+
+Look at metrics RMSE and MAE
+
+```{r}
+# predictions, plus the truth values
+bag_predict <- bag_final_wkf |>
+  fit(bike_train) |>
+  predict(bike_test) |>
+  bind_cols(bike_test |> ungroup() |> select(rented_bike_count))
+
+# compare to predicted values
+bag_metrics <- bind_rows(bag_predict |> 
+                           rmse(truth = rented_bike_count, estimate = .pred),
+                         bag_predict |>
+                           mae(truth = rented_bike_count, estimate = .pred)) |>
+  bind_cols(Model = rep("Bagged Tree", 2)) |>
+  select(Model, everything())
+
+bag_metrics
+```
+
+## Random Forest Model
+
+Define the model
+
+```{r}
+rf_model <- rand_forest(mtry = tune()) |>
+  set_engine("ranger", importance = "impurity") |>
+  set_mode("regression")
+
+```
+
+Create workflow, using same recipe from MLR model 3
+
+```{r}
+rf_wkf <- workflow() |>
+  add_recipe(bike_rec_3) |>
+  add_model(rf_model)
+
+```
+
+Fit to CV folds
+
+```{r}
+rf_fit <- rf_wkf |>
+  tune_grid(resamples = bike_10_fold)
+```
+
+Best parameters
+
+```{r}
+rf_best_params <- rf_fit |>
+  select_best(metric = "rmse")
+
+rf_best_params
+```
+
+Refit on the entire training set
+
+```{r}
+# finalize workflow
+rf_final_wkf <- rf_wkf |>
+  finalize_workflow(rf_best_params)
+
+# fit to the training set
+rf_final_fit <- rf_final_wkf |>
+  last_fit(bike_split)
+
+rf_final_fit |> collect_metrics()
+```
+
+Variable importance plot
+
+```{r}
+# extract model, create vip list
+vip_list <- extract_fit_parsnip(rf_final_fit$.workflow[[1]]) |>
+  vip::vi()
+
+# create vip plot
+vip_list |>
+  mutate(Variable = factor(Variable, levels = Variable)) |>
+  ggplot(aes(x = Variable, y = Importance)) +
+  geom_bar(stat = "identity") +
+  coord_flip()
+```
+
+
+Look at metrics RMSE and MAE
+
+```{r}
+# predictions, plus the truth values
+rf_predict <- rf_final_wkf |>
+  fit(bike_train) |>
+  predict(bike_test) |>
+  bind_cols(bike_test |> ungroup() |> select(rented_bike_count))
+
+# compare to predicted values
+rf_metrics <- bind_rows(rf_predict |> 
+                          rmse(truth = rented_bike_count, estimate = .pred),
+                        rf_predict |>
+                          mae(truth = rented_bike_count, estimate = .pred)) |>
+  bind_cols(Model = rep("Random Forest", 2)) |>
+  select(Model, everything())
+
+rf_metrics
+```
+
+## Best Overall Model
+
+Compare all metrics to find best overall model
+
+```{r}
+bind_rows(MLR_metrics,
+          LASSO_metrics,
+          tree_metrics,
+          bag_metrics,
+          rf_metrics)
+```
+
+Random Forest model seems to be the overall winner, for both RMSE and MAE
+
+## Fit to Entire Data Set
+
+```{r}
+# predictions, plus the truth values
+rf_predict_final <- rf_final_wkf |>
+  fit(bike_train) |>
+  predict(bike_rollup) |>
+  bind_cols(bike_rollup |> ungroup() |> select(rented_bike_count))
+
+# compare to predicted values
+final_metrics <- bind_rows(rf_predict_final |> 
+                             rmse(truth = rented_bike_count, estimate = .pred),
+                           rf_predict_final |>
+                             mae(truth = rented_bike_count, estimate = .pred)) |>
+  bind_cols(Model = rep("Random Forest Final", 2)) |>
+  select(Model, everything())
+
+final_metrics
+```
+
+Final model performed even better on the full data than on the training!
+
+
+```{r}
+# add temperature column to predictions on full data set
+rf_points <- rf_predict_final |>
+  bind_cols(bike_rollup["temperature"])
+
+# plot original data, with the random forest predictions as overlay
+g <- ggplot(bike_rollup, aes(x = temperature, y = rented_bike_count)) 
+g + geom_point(aes(color = seasons)) +
+  geom_line(data = rf_points, aes(x = temperature, y = .pred))
+
+```
+
